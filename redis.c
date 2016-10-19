@@ -2421,7 +2421,11 @@ static redisClient *createClient(int fd) {
 	return c;
 }
 
+// 添加客户端应答消息
 static void addReply(redisClient *c, robj *obj) {
+
+	// 如果当前没有应答消息（说明没有创建发送应答处理句柄）
+	// 并且当前客户端不是Master，或者是Slave且处于在线状态，才创建发送应答方法
 	if (listLength(c->reply) == 0 &&
 	        (c->replstate == REDIS_REPL_NONE ||
 	         c->replstate == REDIS_REPL_ONLINE) &&
