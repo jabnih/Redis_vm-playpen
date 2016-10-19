@@ -2541,11 +2541,13 @@ static void acceptHandler(aeEventLoop *el, int fd, void *privdata, int mask) {
 
 /* ======================= Redis objects implementation ===================== */
 
+// 创建对象
 static robj *createObject(int type, void *ptr) {
 	robj *o;
 
 	if (server.vm_enabled) pthread_mutex_lock(&server.obj_freelist_mutex);
 	if (listLength(server.objfreelist)) {
+		// 如果对象池中有对象，则直接取来用
 		listNode *head = listFirst(server.objfreelist);
 		o = listNodeValue(head);
 		listDelNode(server.objfreelist, head);
@@ -2555,12 +2557,17 @@ static robj *createObject(int type, void *ptr) {
 			pthread_mutex_unlock(&server.obj_freelist_mutex);
 			o = zmalloc(sizeof(*o));
 		} else {
+			// 没有才分配一个新的对象
 			o = zmalloc(sizeof(*o) - sizeof(struct redisObjectVM));
 		}
 	}
+	// 对象的类型（如String,List等）
 	o->type = type;
+	// 目前编码只有两种，INT和RAW，创建时默认为RAW，后续才会尝试转换编码
 	o->encoding = REDIS_ENCODING_RAW;
+	// 对象的值
 	o->ptr = ptr;
+	// 初始化引用个数为1
 	o->refcount = 1;
 	if (server.vm_enabled) {
 		/* Note that this code may run in the context of an I/O thread
@@ -2573,18 +2580,22 @@ static robj *createObject(int type, void *ptr) {
 	return o;
 }
 
+// 创建String对象
 static robj *createStringObject(char *ptr, size_t len) {
 	return createObject(REDIS_STRING, sdsnewlen(ptr, len));
 }
 
+// 复制一个String对象（只复制元数据，浅复制，对应的值只复制"引用"（指针））
 static robj *dupStringObject(robj *o) {
 	assert(o->encoding == REDIS_ENCODING_RAW);
 	return createStringObject(o->ptr, sdslen(o->ptr));
 }
 
+// 创建List对象
 static robj *createListObject(void) {
 	list *l = listCreate();
 
+	// List内释放节点的值方法为decrRefCount
 	listSetFreeMethod(l, decrRefCount);
 	return createObject(REDIS_LIST, l);
 }
@@ -2602,12 +2613,14 @@ static robj *createZsetObject(void) {
 	return createObject(REDIS_ZSET, zs);
 }
 
+// 释放字符串对象
 static void freeStringObject(robj *o) {
 	if (o->encoding == REDIS_ENCODING_RAW) {
 		sdsfree(o->ptr);
 	}
 }
 
+// 释放链表对象
 static void freeListObject(robj *o) {
 	listRelease((list*) o->ptr);
 }
@@ -2628,11 +2641,13 @@ static void freeHashObject(robj *o) {
 	dictRelease((dict*) o->ptr);
 }
 
+// 增加对象的引用
 static void incrRefCount(robj *o) {
 	redisAssert(!server.vm_enabled || o->storage == REDIS_VM_MEMORY);
 	o->refcount++;
 }
 
+// 降低对象的引用，只有当引用个数为0时才真正释放内存
 static void decrRefCount(void *obj) {
 	robj *o = obj;
 
@@ -2661,6 +2676,7 @@ static void decrRefCount(void *obj) {
 		if (server.vm_enabled && o->storage == REDIS_VM_SWAPPING)
 			vmCancelThreadedIOJob(obj);
 		switch (o->type) {
+		// 根据对象的类型来释放对象的值
 		case REDIS_STRING: freeStringObject(o); break;
 		case REDIS_LIST: freeListObject(o); break;
 		case REDIS_SET: freeSetObject(o); break;
@@ -2669,6 +2685,7 @@ static void decrRefCount(void *obj) {
 		default: redisAssert(0 != 0); break;
 		}
 		if (server.vm_enabled) pthread_mutex_lock(&server.obj_freelist_mutex);
+		// 如果对象池中的对象个数没有大于设定的阈值，则将该对象先缓存起来，减少创建和释放的次数
 		if (listLength(server.objfreelist) > REDIS_OBJFREELIST_MAX ||
 		        !listAddNodeHead(server.objfreelist, o))
 			zfree(o);
