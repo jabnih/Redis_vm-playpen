@@ -317,6 +317,7 @@ typedef struct redisClient {
 	int multibulk;          /* multi bulk command format active */
 	// 待发给客户端的应答
 	list *reply;
+	// 记录当前列表头元素对象已经发送的数据长度（用于数据量大的对象分多次发送）
 	int sentlen;
 	// 最后一次交互的时间，用于关闭超时的客户端
 	time_t lastinteraction; /* time of the last interaction, used for timeout */
@@ -385,6 +386,7 @@ struct redisServer {
 	/* Configuration */
 	// 日志过滤级别
 	int verbosity;
+	// 标志位，1表示开启，将应答消息组合起来批量发送出去
 	int glueoutputbuf;
 	// 客户端最大空闲时间
 	int maxidletime;
@@ -1812,11 +1814,13 @@ static void glueReplyBuffersIfNeeded(redisClient *c) {
 			copylen += objlen;
 			listDelNode(c->reply, ln);
 		} else {
+			// copylen为0表示第一个消息已经大于1024了，无需组合起来
 			if (copylen == 0) return;
 			break;
 		}
 	}
 	/* Now the output buffer is empty, add the new single element */
+	// 到了这里，表示buf中有数据，可能是由多条短消息组合而成的，封装成对象，重新放回到应答列表中
 	o = createObject(REDIS_STRING, sdsnewlen(buf, copylen));
 	listAddNodeHead(c->reply, o);
 }
@@ -1828,6 +1832,9 @@ static void sendReplyToClient(aeEventLoop *el, int fd, void *privdata, int mask)
 	REDIS_NOTUSED(el);
 	REDIS_NOTUSED(mask);
 
+	/* 如果没有开启glueoutputbuf，但是当前的应答已经大于设定的阈值
+	*  并且客户端不是Master，则会使用writev批量发送数据
+	*/
 	/* Use writev() if we have enough buffers to send */
 	if (!server.glueoutputbuf &&
 	        listLength(c->reply) > REDIS_WRITEV_THRESHOLD &&
@@ -1838,6 +1845,7 @@ static void sendReplyToClient(aeEventLoop *el, int fd, void *privdata, int mask)
 	}
 
 	while (listLength(c->reply)) {
+		// 如果开启了批量发送，并且有超过两个应答消息，则尽可能的将多条短小的消息组合成一条
 		if (server.glueoutputbuf && listLength(c->reply) > 1)
 			glueReplyBuffersIfNeeded(c);
 
@@ -1851,15 +1859,20 @@ static void sendReplyToClient(aeEventLoop *el, int fd, void *privdata, int mask)
 
 		if (c->flags & REDIS_MASTER) {
 			/* Don't reply to a master */
+			// 这里不发送，仅仅是记录为全部数据已发送出去（如果为Master，则sentlen的值为0）
 			nwritten = objlen - c->sentlen;
 		} else {
+			// nwritten 此次发送出去的字节
 			nwritten = write(fd, ((char*)o->ptr) + c->sentlen, objlen - c->sentlen);
 			if (nwritten <= 0) break;
 		}
+		// 偏移此次发送出去的字节数
 		c->sentlen += nwritten;
+		// totwritten用于控制当次最大发送量，防止在写上阻塞过长时间
 		totwritten += nwritten;
 		/* If we fully sent the object on head go to the next one */
 		if (c->sentlen == objlen) {
+			// 当前对象的数据已经全部发送出去了，所以可以从应答列表中删除
 			listDelNode(c->reply, listFirst(c->reply));
 			c->sentlen = 0;
 		}
@@ -1868,6 +1881,7 @@ static void sendReplyToClient(aeEventLoop *el, int fd, void *privdata, int mask)
 		 * other clients as well, even if a very large request comes from
 		 * super fast link that is always able to accept data (in real world
 		 * scenario think about 'KEYS *' against the loopback interfae) */
+		// 一次最多发送64K
 		if (totwritten > REDIS_MAX_WRITE_PER_EVENT) break;
 	}
 	if (nwritten == -1) {
@@ -1880,8 +1894,10 @@ static void sendReplyToClient(aeEventLoop *el, int fd, void *privdata, int mask)
 			return;
 		}
 	}
+	// 只有当总发送字节数大于0，才会断定会这是一次有效的会话，设置最后交互时间
 	if (totwritten > 0) c->lastinteraction = time(NULL);
 	if (listLength(c->reply) == 0) {
+		// 所有应答消息已经发送完毕，可以从事件循环中移除写句柄
 		c->sentlen = 0;
 		aeDeleteFileEvent(server.el, c->fd, AE_WRITABLE);
 	}
@@ -1899,18 +1915,24 @@ static void sendReplyToClientWritev(aeEventLoop *el, int fd, void *privdata, int
 
 	listNode *node;
 	while (listLength(c->reply)) {
+		// 获取当前对象已发送的偏移
 		offset = c->sentlen;
 		ion = 0;
+		// 用于标识是否有数据要发送
 		willwrite = 0;
 
 		/* fill-in the iov[] array */
 		for (node = listFirst(c->reply); node; node = listNextNode(node)) {
+			// 下面循环填充iov缓冲区
 			o = listNodeValue(node);
 			objlen = sdslen(o->ptr);
 
+			// 如果当前对象剩余的数据量(objlen-offset)已经大于64K，则不使用writev发送
+			// 或者已经发送的数据加上剩余的大于64K，则退出（控制单次处理发送数量）
 			if (totwritten + objlen - offset > REDIS_MAX_WRITE_PER_EVENT)
 				break;
 
+			// 一次最多256个
 			if (ion == REDIS_WRITEV_IOVEC_COUNT)
 				break; /* no more iovecs */
 
@@ -1939,6 +1961,7 @@ static void sendReplyToClientWritev(aeEventLoop *el, int fd, void *privdata, int
 		offset = c->sentlen;
 
 		/* remove written robjs from c->reply */
+		// 移除所有已发送的应答
 		while (nwritten && listLength(c->reply)) {
 			o = listNodeValue(listFirst(c->reply));
 			objlen = sdslen(o->ptr);
@@ -1949,6 +1972,7 @@ static void sendReplyToClientWritev(aeEventLoop *el, int fd, void *privdata, int
 				c->sentlen = 0;
 			} else {
 				/* partial write */
+				// 只写了一半
 				c->sentlen += nwritten;
 				break;
 			}
