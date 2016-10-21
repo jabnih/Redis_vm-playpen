@@ -2849,6 +2849,7 @@ static int tryObjectEncoding(robj *o) {
 
 /* Get a decoded version of an encoded object (returned as a new object).
  * If the object is already raw-encoded just increment the ref count. */
+// 将编码为整型的字符串解码后返回
 static robj *getDecodedObject(robj *o) {
 	robj *dec;
 
@@ -2911,17 +2912,26 @@ static size_t stringObjectLen(robj *o) {
 
 /*============================ RDB saving/loading =========================== */
 
+// RDB通过一个字节来表示value的编码类型（0:String,1:List,etc,还有0xFE指示Selector等）
 static int rdbSaveType(FILE *fp, unsigned char type) {
 	if (fwrite(&type, 1, 1, fp) == 0) return -1;
 	return 0;
 }
 
+// 过期时间为4字节
 static int rdbSaveTime(FILE *fp, time_t t) {
 	int32_t t32 = (int32_t) t;
 	if (fwrite(&t32, 4, 1, fp) == 0) return -1;
 	return 0;
 }
 
+/**
+* Redis对于长度采用的是扩展操作码的技术，其中前两个bit位用于指示：
+* 00 : 后6bit代表长度
+* 01 : 后14bit代表长度
+* 10 : 后6bit不用，后续4字节代表长度
+* 11 : 自定义扩展，后6bit用于代表编码的格式(11:REDIS_RDB_ENCVAL，如REDIS_RDB_ENC_INT8)
+*/
 /* check rdbLoadLen() comments for more info */
 static int rdbSaveLen(FILE *fp, uint32_t len) {
 	unsigned char buf[2];
@@ -2948,13 +2958,19 @@ static int rdbSaveLen(FILE *fp, uint32_t len) {
 /* String objects in the form "2391" "-100" without any space and with a
  * range of values that can fit in an 8, 16 or 32 bit signed value can be
  * encoded as integers to save space */
+// 尝试将String类型转换为整型，用于节省空间
 static int rdbTryIntegerEncoding(sds s, unsigned char *enc) {
 	long long value;
 	char *endptr, buf[32];
 
 	/* Check if it's possible to encode this value as a number */
+	// 将String转换为长整型，如果剩余的字符不为空（含有其它字符），则转换失败
 	value = strtoll(s, &endptr, 10);
 	if (endptr[0] != '\0') return 0;
+	/* 转换成功后，再将长整型转换回字符串
+	* 用于比较是否相同（即使存在0100.00字符串，转换为100，但是字符串不再相同了，也不允许转换，
+	* 因为这样可能会导致客户端存进去的数据和取出来的数据不一致）
+	*/
 	snprintf(buf, 32, "%lld", value);
 
 	/* If the number converted back into a string is not identical
@@ -2963,6 +2979,7 @@ static int rdbTryIntegerEncoding(sds s, unsigned char *enc) {
 
 	/* Finally check if it fits in our ranges */
 	if (value >= -(1 << 7) && value <= (1 << 7) - 1) {
+		// 使用的是11自定义编码（见长度编码）
 		enc[0] = (REDIS_RDB_ENCVAL << 6) | REDIS_RDB_ENC_INT8;
 		enc[1] = value & 0xFF;
 		return 2;
@@ -2983,6 +3000,7 @@ static int rdbTryIntegerEncoding(sds s, unsigned char *enc) {
 	}
 }
 
+// 使用LZF压缩算法压缩
 static int rdbSaveLzfStringObject(FILE *fp, robj *obj) {
 	unsigned int comprlen, outlen;
 	unsigned char byte;
@@ -2997,6 +3015,9 @@ static int rdbSaveLzfStringObject(FILE *fp, robj *obj) {
 		zfree(out);
 		return 0;
 	}
+	/* 格式为 使用长度编码方式的扩展类型11，后6bit指示LZF压缩
+	* 后面保存压缩的长度和未压缩的长度，最后是压缩后的数据
+	*/
 	/* Data compressed! Let's save it on disk */
 	byte = (REDIS_RDB_ENCVAL << 6) | REDIS_RDB_ENC_LZF;
 	if (fwrite(&byte, 1, 1, fp) == 0) goto writeerr;
@@ -3013,6 +3034,11 @@ writeerr:
 
 /* Save a string objet as [len][data] on disk. If the object is a string
  * representation of an integer value we try to safe it in a special form */
+/* 保存原始字符串
+* 1. 长度小于11，尝试转换为整数编码
+* 2. 长度大于20，尝试使用LZF压缩再保存
+* 3. 如果上述都失败，那么直接保存
+*/
 static int rdbSaveStringObjectRaw(FILE *fp, robj *obj) {
 	size_t len;
 	int enclen;
@@ -3046,6 +3072,7 @@ static int rdbSaveStringObjectRaw(FILE *fp, robj *obj) {
 }
 
 /* Like rdbSaveStringObjectRaw() but handle encoded objects */
+// 和上面的RAW类似，但是会处理编码过的对象（先解码再保存）
 static int rdbSaveStringObject(FILE *fp, robj *obj) {
 	int retval;
 
@@ -3072,6 +3099,7 @@ static int rdbSaveStringObject(FILE *fp, robj *obj) {
  * 254: + inf
  * 255: - inf
  */
+// 保存Double
 static int rdbSaveDoubleValue(FILE *fp, double val) {
 	unsigned char buf[128];
 	int len;
@@ -3092,6 +3120,9 @@ static int rdbSaveDoubleValue(FILE *fp, double val) {
 }
 
 /* Save a Redis object. */
+// 保存Redis对象
+//（在Redis里，所有数据（Key,Value）都是String（除非编码过），
+// 只是数据结构不一样，所以需要遍历该数据结构，再依次保存）
 static int rdbSaveObject(FILE *fp, robj *o) {
 	if (o->type == REDIS_STRING) {
 		/* Save a string value */
@@ -3147,6 +3178,9 @@ static int rdbSaveObject(FILE *fp, robj *o) {
  * the rdbSaveObject() function. Currently we use a trick to get
  * this length with very little changes to the code. In the future
  * we could switch to a faster solution. */
+// 保存对象长度，这里通过一个小技巧来完成：
+// 传入rdbSavedObjectLen(o,null)，通过rewind将devnull重定向到文件开头，
+// 将对象写入devnull中，然后通过ftello来获取当前偏移位置来取得对象长度
 static off_t rdbSavedObjectLen(robj *o, FILE *fp) {
 	if (fp == NULL) fp = server.devnull;
 	rewind(fp);
@@ -3162,6 +3196,7 @@ static off_t rdbSavedObjectPages(robj *o, FILE *fp) {
 }
 
 /* Save the DB on disk. Return REDIS_ERR on error, REDIS_OK on success */
+// 进行RDB持久化
 static int rdbSave(char *filename) {
 	dictIterator *di = NULL;
 	dictEntry *de;
@@ -3182,6 +3217,7 @@ static int rdbSave(char *filename) {
 		redisLog(REDIS_WARNING, "Failed saving the DB: %s", strerror(errno));
 		return REDIS_ERR;
 	}
+	// 写入REDIS魔数用于快速判断一个文件是否是RDB文件，后面跟着4位版本号 0001
 	if (fwrite("REDIS0001", 9, 1, fp) == 0) goto werr;
 	for (j = 0; j < server.dbnum; j++) {
 		redisDb *db = server.db + j;
@@ -3192,11 +3228,13 @@ static int rdbSave(char *filename) {
 			fclose(fp);
 			return REDIS_ERR;
 		}
-
+		// RDB后续的格式为,指示ID的类型以及DB的id
 		/* Write the SELECT DB opcode */
 		if (rdbSaveType(fp, REDIS_SELECTDB) == -1) goto werr;
 		if (rdbSaveLen(fp, j) == -1) goto werr;
 
+		// 接着就是所有的key-value键值对
+		//（如果含有过期时间，并且大于当前时间，则先写入过期时间，再写入key-value）
 		/* Iterate this DB writing every entry */
 		while ((de = dictNext(di)) != NULL) {
 			robj *key = dictGetEntryKey(de);
@@ -3233,22 +3271,27 @@ static int rdbSave(char *filename) {
 		}
 		dictReleaseIterator(di);
 	}
+	// 最后面是EOF结束符
 	/* EOF opcode */
 	if (rdbSaveType(fp, REDIS_EOF) == -1) goto werr;
 
 	/* Make sure data will not remain on the OS's output buffers */
 	fflush(fp);
+	// 取得文件的fd，将写入文件的内容刷到磁盘中（高速缓存）（只对该文件进行持久化写入，并等待返回）
 	fsync(fileno(fp));
 	fclose(fp);
 
 	/* Use RENAME to make sure the DB file is changed atomically only
 	 * if the generate DB file is ok. */
+	// 重命名文件，这里重命名后，之前打开的旧RDB依旧有效，只有当其文件引用变为0时才会真正删除
 	if (rename(tmpfile, filename) == -1) {
 		redisLog(REDIS_WARNING, "Error moving temp DB file on the final destination: %s", strerror(errno));
 		unlink(tmpfile);
 		return REDIS_ERR;
 	}
 	redisLog(REDIS_NOTICE, "DB saved on disk");
+	// 这里有个问题，再进行RDB的时候，如果更改了数据，此时将dirty置为0是不是就丢失了这中间的次数？
+	// 不过这应该影响比较小，只有在高并发的时候，更改次数比较频繁，才会受到影响
 	server.dirty = 0;
 	server.lastsave = time(NULL);
 	return REDIS_OK;
@@ -3261,6 +3304,7 @@ werr:
 	return REDIS_ERR;
 }
 
+// 通过fork一个进程，后台进行RDB持久化
 static int rdbSaveBackground(char *filename) {
 	pid_t childpid;
 
@@ -3289,6 +3333,7 @@ static int rdbSaveBackground(char *filename) {
 	return REDIS_OK; /* unreached */
 }
 
+// 删除临时RDB文件
 static void rdbRemoveTempFile(pid_t childpid) {
 	char tmpfile[256];
 
