@@ -331,9 +331,12 @@ typedef struct redisClient {
 	off_t repldbsize;       /* replication DB file size */
 	// 执行MULTI时保存的状态信息（所有的请求命令）
 	multiState mstate;      /* MULTI/EXEC state */
+	// 当前阻塞等待的键（用于实现BLPOP类似的命令）
 	robj **blockingkeys;    /* The key we waiting to terminate a blocking
                              * operation such as BLPOP. Otherwise NULL. */
+	// 等待阻塞键的个数
 	int blockingkeysnum;    /* Number of blocking keys */
+	// 阻塞等待的超时时间
 	time_t blockingto;      /* Blocking operation timeout. If UNIX current time
                              * is >= blockingto then the operation timed out. */
 	list *io_keys;          /* Keys this client is waiting to be loaded from the
@@ -2723,15 +2726,19 @@ static robj *lookupKey(redisDb *db, robj *key) {
 }
 
 static robj *lookupKeyRead(redisDb *db, robj *key) {
+	// 删除过期的数据
 	expireIfNeeded(db, key);
 	return lookupKey(db, key);
 }
 
 static robj *lookupKeyWrite(redisDb *db, robj *key) {
+	// 当有需要写入的时候，会先将含有过期时间的键删除，无论有没有过期
+	//（这样子设计很不合理，因为存在List含有过期时间，如果向其添加数据，则会将整个List删除，即便没有过期）
 	deleteIfVolatile(db, key);
 	return lookupKey(db, key);
 }
 
+// 根据给定的key删除DB里面的键值对
 static int deleteKey(redisDb *db, robj *key) {
 	int retval;
 
@@ -2739,8 +2746,11 @@ static int deleteKey(redisDb *db, robj *key) {
 	 * it may happen that 'key' is no longer valid if we don't increment
 	 * it's count. This may happen when we get the object reference directly
 	 * from the hash table with dictRandomKey() or dict iterators */
+	// 用来防止key被删除，因为可能使用的是共享池里面的对象
 	incrRefCount(key);
+	// 先删除过期字典的中键
 	if (dictSize(db->expires)) dictDelete(db->expires, key);
+	// 再删除DB中的键值对
 	retval = dictDelete(db->dict, key);
 	decrRefCount(key);
 
@@ -3638,6 +3648,8 @@ static void echoCommand(redisClient *c) {
 static void setGenericCommand(redisClient *c, int nx) {
 	int retval;
 
+	// 如果使用SETNX 命令，则会将设置了过期时间的键删除，无论是有没有过期
+	//（后续3.0改了，SETNX只有键不存在或者过期才会真正执行SET）
 	if (nx) deleteIfVolatile(c->db, c->argv[1]);
 	retval = dictAdd(c->db->dict, c->argv[1], c->argv[2]);
 	if (retval == DICT_ERR) {
@@ -3832,6 +3844,7 @@ static void decrbyCommand(redisClient *c) {
 
 /* ========================= Type agnostic commands ========================= */
 
+// 删除一个键，返回删除的个数
 static void delCommand(redisClient *c) {
 	int deleted = 0, j;
 
@@ -3841,6 +3854,8 @@ static void delCommand(redisClient *c) {
 			deleted++;
 		}
 	}
+	// 这里不直接使用default里面的方式，为了节省创建字符串应答的时间，提高性能，
+	// （删除多半是发生在删除一个键或者键不存在的情况）
 	switch (deleted) {
 	case 0:
 		addReply(c, shared.czero);
@@ -3854,6 +3869,7 @@ static void delCommand(redisClient *c) {
 	}
 }
 
+// 判断一个键是否存在，存在则返回1，不存在返回0
 static void existsCommand(redisClient *c) {
 	addReply(c, lookupKeyRead(c->db, c->argv[1]) ? shared.cone : shared.czero);
 }
@@ -3926,6 +3942,7 @@ static void lastsaveCommand(redisClient *c) {
 	            sdscatprintf(sdsempty(), ":%lu\r\n", server.lastsave));
 }
 
+// 获取值的数据类型
 static void typeCommand(redisClient *c) {
 	robj *o;
 	char *type;
@@ -4090,16 +4107,20 @@ static void moveCommand(redisClient *c) {
 }
 
 /* =================================== Lists ================================ */
+// 向列表增加元素，其中where控制在左边还是右边
 static void pushGenericCommand(redisClient *c, int where) {
 	robj *lobj;
 	list *list;
 
+	// 查询写入键对应的值
 	lobj = lookupKeyWrite(c->db, c->argv[1]);
 	if (lobj == NULL) {
+		// 处理阻塞等待的客户端
 		if (handleClientsWaitingListPush(c, c->argv[1], c->argv[2])) {
 			addReply(c, shared.ok);
 			return;
 		}
+		// 创建List对象，并将数据放入List中
 		lobj = createListObject();
 		list = lobj->ptr;
 		if (where == REDIS_HEAD) {
@@ -4111,6 +4132,7 @@ static void pushGenericCommand(redisClient *c, int where) {
 		incrRefCount(c->argv[1]);
 		incrRefCount(c->argv[2]);
 	} else {
+		// 和上面代码差不多，只是多了类型检查以及少了对象值的创建和键的添加
 		if (lobj->type != REDIS_LIST) {
 			addReply(c, shared.wrongtypeerr);
 			return;
@@ -4131,14 +4153,17 @@ static void pushGenericCommand(redisClient *c, int where) {
 	addReply(c, shared.ok);
 }
 
+// 从列表左边增加元素
 static void lpushCommand(redisClient *c) {
 	pushGenericCommand(c, REDIS_HEAD);
 }
 
+// 从列表右边增加元素
 static void rpushCommand(redisClient *c) {
 	pushGenericCommand(c, REDIS_TAIL);
 }
 
+// 获取链表长度
 static void llenCommand(redisClient *c) {
 	robj *o;
 	list *l;
@@ -4157,10 +4182,12 @@ static void llenCommand(redisClient *c) {
 	}
 }
 
+// 获取链表指定下标的元素值，从0开始，同理，也是根据index的正负来决定左右方向
 static void lindexCommand(redisClient *c) {
 	robj *o;
 	int index = atoi(c->argv[2]->ptr);
 
+	// 查找Key对应的value
 	o = lookupKeyRead(c->db, c->argv[1]);
 	if (o == NULL) {
 		addReply(c, shared.nullbulk);
@@ -4184,6 +4211,7 @@ static void lindexCommand(redisClient *c) {
 	}
 }
 
+// 设置List指定下标元素的值
 static void lsetCommand(redisClient *c) {
 	robj *o;
 	int index = atoi(c->argv[2]->ptr);
@@ -4200,6 +4228,7 @@ static void lsetCommand(redisClient *c) {
 
 			ln = listIndex(list, index);
 			if (ln == NULL) {
+				// 空，超出范围
 				addReply(c, shared.outofrangeerr);
 			} else {
 				robj *ele = listNodeValue(ln);
@@ -4214,6 +4243,7 @@ static void lsetCommand(redisClient *c) {
 	}
 }
 
+// 从链表弹出元素
 static void popGenericCommand(redisClient *c, int where) {
 	robj *o;
 
@@ -4246,14 +4276,17 @@ static void popGenericCommand(redisClient *c, int where) {
 	}
 }
 
+// 从链表左边弹出元素
 static void lpopCommand(redisClient *c) {
 	popGenericCommand(c, REDIS_HEAD);
 }
 
+// 从链表右边弹出元素
 static void rpopCommand(redisClient *c) {
 	popGenericCommand(c, REDIS_TAIL);
 }
 
+// 获取链表指定范围的元素
 static void lrangeCommand(redisClient *c) {
 	robj *o;
 	int start = atoi(c->argv[2]->ptr);
@@ -4301,6 +4334,7 @@ static void lrangeCommand(redisClient *c) {
 	}
 }
 
+// 保留List指定范围区间的元素
 static void ltrimCommand(redisClient *c) {
 	robj *o;
 	int start = atoi(c->argv[2]->ptr);
@@ -4350,6 +4384,9 @@ static void ltrimCommand(redisClient *c) {
 	}
 }
 
+// 删除链表中指定值的元素
+// 其中第二个参数count大于0则从左边开始，小于0则从右边开始,删除|count|个
+// 第三个参数为要删除的值
 static void lremCommand(redisClient *c) {
 	robj *o;
 
@@ -4403,8 +4440,10 @@ static void lremCommand(redisClient *c) {
  * since the element is not just returned but pushed against another list
  * as well. This command was originally proposed by Ezra Zygmuntowicz.
  */
+// 从链表的右边弹出，放到另一个链表的左边（也可以是同一个链表）
 static void rpoplpushcommand(redisClient *c) {
 	robj *sobj;
+
 
 	sobj = lookupKeyWrite(c->db, c->argv[1]);
 	if (sobj == NULL) {
@@ -4414,6 +4453,7 @@ static void rpoplpushcommand(redisClient *c) {
 			addReply(c, shared.wrongtypeerr);
 		} else {
 			list *srclist = sobj->ptr;
+			// 从第一个链表Src右边取出数据
 			listNode *ln = listLast(srclist);
 
 			if (ln == NULL) {
@@ -4437,6 +4477,7 @@ static void rpoplpushcommand(redisClient *c) {
 						dictAdd(c->db->dict, c->argv[2], dobj);
 						incrRefCount(c->argv[2]);
 					}
+					// 如果没有阻塞的客户端等待，才放入到链表dst左边
 					dstlist = dobj->ptr;
 					listAddNodeHead(dstlist, ele);
 					incrRefCount(ele);
@@ -4458,11 +4499,15 @@ static void rpoplpushcommand(redisClient *c) {
 
 /* ==================================== Sets ================================ */
 
+// 此版本的Set采用的是Dict哈希映射来实现的
+
+// 添加集合元素
 static void saddCommand(redisClient *c) {
 	robj *set;
 
 	set = lookupKeyWrite(c->db, c->argv[1]);
 	if (set == NULL) {
+		// 创建集合对象
 		set = createSetObject();
 		dictAdd(c->db->dict, c->argv[1], set);
 		incrRefCount(c->argv[1]);
@@ -4475,12 +4520,15 @@ static void saddCommand(redisClient *c) {
 	if (dictAdd(set->ptr, c->argv[2], NULL) == DICT_OK) {
 		incrRefCount(c->argv[2]);
 		server.dirty++;
+		// 成功则返回1
 		addReply(c, shared.cone);
 	} else {
+		// 元素已经存在，返回0
 		addReply(c, shared.czero);
 	}
 }
 
+// 删除集合中的元素
 static void sremCommand(redisClient *c) {
 	robj *set;
 
@@ -4497,6 +4545,7 @@ static void sremCommand(redisClient *c) {
 			if (htNeedsResize(set->ptr)) dictResize(set->ptr);
 			addReply(c, shared.cone);
 		} else {
+			// 元素不存在
 			addReply(c, shared.czero);
 		}
 	}
@@ -4537,6 +4586,7 @@ static void smoveCommand(redisClient *c) {
 	addReply(c, shared.cone);
 }
 
+// 判断集合元素是否存在
 static void sismemberCommand(redisClient *c) {
 	robj *set;
 
@@ -4555,6 +4605,7 @@ static void sismemberCommand(redisClient *c) {
 	}
 }
 
+// 获取集合元素个数
 static void scardCommand(redisClient *c) {
 	robj *o;
 	dict *s;
@@ -4574,6 +4625,7 @@ static void scardCommand(redisClient *c) {
 	}
 }
 
+// 从集合中弹出一个元素（随机）
 static void spopCommand(redisClient *c) {
 	robj *set;
 	dictEntry *de;
@@ -4602,6 +4654,7 @@ static void spopCommand(redisClient *c) {
 	}
 }
 
+// 和spopCommand实现类似，只是少了元素删除的操作
 static void srandmemberCommand(redisClient *c) {
 	robj *set;
 	dictEntry *de;
@@ -4736,6 +4789,7 @@ static void sinterstoreCommand(redisClient *c) {
 #define REDIS_OP_UNION 0
 #define REDIS_OP_DIFF 1
 
+// 集合操作
 static void sunionDiffGenericCommand(redisClient *c, robj **setskeys, int setsnum, robj *dstkey, int op) {
 	dict **dv = zmalloc(sizeof(dict*)*setsnum);
 	dictIterator *di;
@@ -4743,6 +4797,7 @@ static void sunionDiffGenericCommand(redisClient *c, robj **setskeys, int setsnu
 	robj *dstset = NULL;
 	int j, cardinality = 0;
 
+	// 查找出Key对应的集合，并校验类型
 	for (j = 0; j < setsnum; j++) {
 		robj *setobj;
 
@@ -4764,6 +4819,7 @@ static void sunionDiffGenericCommand(redisClient *c, robj **setskeys, int setsnu
 	/* We need a temp set object to store our union. If the dstkey
 	 * is not NULL (that is, we are inside an SUNIONSTORE operation) then
 	 * this set object will be the resulting object to set into the target key*/
+	// 用于临时存储集合操作的结果，如果dstkey不为空，则用此对象替换掉该key对应的值
 	dstset = createSetObject();
 
 	/* Iterate all the elements of all the sets, add every element a single
@@ -4780,11 +4836,14 @@ static void sunionDiffGenericCommand(redisClient *c, robj **setskeys, int setsnu
 			/* dictAdd will not add the same element multiple times */
 			ele = dictGetEntryKey(de);
 			if (op == REDIS_OP_UNION || j == 0) {
+				// 集合并操作，将所有元素都添加到dstset中
+				// 或者是集合差操作，但是第一个集合作为初始集合
 				if (dictAdd(dstset->ptr, ele, NULL) == DICT_OK) {
 					incrRefCount(ele);
 					cardinality++;
 				}
 			} else if (op == REDIS_OP_DIFF) {
+				// 集合差操作，当前集合所拥有的元素从初始集合中删除
 				if (dictDelete(dstset->ptr, ele) == DICT_OK) {
 					cardinality--;
 				}
@@ -4827,18 +4886,22 @@ static void sunionDiffGenericCommand(redisClient *c, robj **setskeys, int setsnu
 	zfree(dv);
 }
 
+// 集合并
 static void sunionCommand(redisClient *c) {
 	sunionDiffGenericCommand(c, c->argv + 1, c->argc - 1, NULL, REDIS_OP_UNION);
 }
 
+// 集合并，然后将结果存储到指定的Key中
 static void sunionstoreCommand(redisClient *c) {
 	sunionDiffGenericCommand(c, c->argv + 2, c->argc - 2, c->argv[1], REDIS_OP_UNION);
 }
 
+// 集合差
 static void sdiffCommand(redisClient *c) {
 	sunionDiffGenericCommand(c, c->argv + 1, c->argc - 1, NULL, REDIS_OP_DIFF);
 }
 
+// 集合差，然后将结果存储到指定的Key中
 static void sdiffstoreCommand(redisClient *c) {
 	sunionDiffGenericCommand(c, c->argv + 2, c->argc - 2, c->argv[1], REDIS_OP_DIFF);
 }
@@ -5946,6 +6009,7 @@ static time_t getExpire(redisDb *db, robj *key) {
 	return (time_t) dictGetEntryVal(de);
 }
 
+// 删除过期的数据
 static int expireIfNeeded(redisDb *db, robj *key) {
 	time_t when;
 	dictEntry *de;
@@ -5963,6 +6027,7 @@ static int expireIfNeeded(redisDb *db, robj *key) {
 	return dictDelete(db->dict, key) == DICT_OK;
 }
 
+// 如果键设置了过期时间，则直接删除
 static int deleteIfVolatile(redisDb *db, robj *key) {
 	dictEntry *de;
 
@@ -6158,6 +6223,7 @@ static void blockForKeys(redisClient *c, robj **keys, int numkeys, time_t timeou
 }
 
 /* Unblock a client that's waiting in a blocking operation such as BLPOP */
+// 将客户端从阻塞列表中移除（一般是获取到了数据）
 static void unblockClientWaitingData(redisClient *c) {
 	dictEntry *de;
 	list *l;
@@ -6165,6 +6231,7 @@ static void unblockClientWaitingData(redisClient *c) {
 
 	assert(c->blockingkeys != NULL);
 	/* The client may wait for multiple keys, so unblock it for every key. */
+	// 一个客户端可能在等待多个Key（如BLPOP key1 key2）
 	for (j = 0; j < c->blockingkeysnum; j++) {
 		/* Remove this client from the list of clients waiting for this key. */
 		de = dictFind(c->db->blockingkeys, c->blockingkeys[j]);
@@ -6206,6 +6273,7 @@ static void unblockClientWaitingData(redisClient *c) {
  * If the function returns 1 there was a client waiting for a list push
  * against this key, the element was passed to this client thus it's not
  * needed to actually add it to the list and the caller should return asap. */
+// 处理BLPOP,BRPOP这类阻塞型命令，如果有客户端在等待，则直接放到客户端应答中，而不再放入List中
 static int handleClientsWaitingListPush(redisClient *c, robj *key, robj *ele) {
 	struct dictEntry *de;
 	redisClient *receiver;
@@ -6231,6 +6299,7 @@ static int handleClientsWaitingListPush(redisClient *c, robj *key, robj *ele) {
 }
 
 /* Blocking RPOP/LPOP */
+// 阻塞式获取链表的元素
 static void blockingPopGenericCommand(redisClient *c, int where) {
 	robj *o;
 	time_t timeout;
@@ -6239,6 +6308,7 @@ static void blockingPopGenericCommand(redisClient *c, int where) {
 	for (j = 1; j < c->argc - 1; j++) {
 		o = lookupKeyWrite(c->db, c->argv[j]);
 		if (o != NULL) {
+			// 链表中存在元素，无需阻塞
 			if (o->type != REDIS_LIST) {
 				addReply(c, shared.wrongtypeerr);
 				return;
@@ -6280,6 +6350,7 @@ static void blockingPopGenericCommand(redisClient *c, int where) {
 	/* If the list is empty or the key does not exists we must block */
 	timeout = strtol(c->argv[c->argc - 1]->ptr, NULL, 10);
 	if (timeout > 0) timeout += time(NULL);
+	// 阻塞，直到有元素
 	blockForKeys(c, c->argv + 1, c->argc - 2, timeout);
 }
 
