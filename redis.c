@@ -4934,6 +4934,7 @@ static zskiplistNode *zslCreateNode(int level, double score, robj *obj) {
 	return zn;
 }
 
+// 创建跳跃表Skiplist
 static zskiplist *zslCreate(void) {
 	int j;
 	zskiplist *zsl;
@@ -4941,6 +4942,7 @@ static zskiplist *zslCreate(void) {
 	zsl = zmalloc(sizeof(*zsl));
 	zsl->level = 1;
 	zsl->length = 0;
+	// 头结点初始化创建MAX_LEVEL层，用于保存后续每一层的开始指针
 	zsl->header = zslCreateNode(ZSKIPLIST_MAXLEVEL, 0, NULL);
 	for (j = 0; j < ZSKIPLIST_MAXLEVEL; j++)
 		zsl->header->forward[j] = NULL;
@@ -4949,18 +4951,21 @@ static zskiplist *zslCreate(void) {
 	return zsl;
 }
 
+// 释放节点
 static void zslFreeNode(zskiplistNode *node) {
 	decrRefCount(node->obj);
 	zfree(node->forward);
 	zfree(node);
 }
 
+// 释放Skiplist
 static void zslFree(zskiplist *zsl) {
 	zskiplistNode *node = zsl->header->forward[0], *next;
 
 	zfree(zsl->header->forward);
 	zfree(zsl->header);
 	while (node) {
+		// 和正常List一样，从底层逐个释放
 		next = node->forward[0];
 		zslFreeNode(node);
 		node = next;
@@ -4968,6 +4973,7 @@ static void zslFree(zskiplist *zsl) {
 	zfree(zsl);
 }
 
+// 随机层数，概率为1/4(空间复杂度为1-(1-p)约为1.33)
 static int zslRandomLevel(void) {
 	int level = 1;
 	while ((random() & 0xFFFF) < (ZSKIPLIST_P * 0xFFFF))
@@ -4975,11 +4981,15 @@ static int zslRandomLevel(void) {
 	return level;
 }
 
+// 插入节点
 static void zslInsert(zskiplist *zsl, double score, robj *obj) {
 	zskiplistNode *update[ZSKIPLIST_MAXLEVEL], *x;
 	int i, level;
 
 	x = zsl->header;
+	// 查找每一层比score小的节点（即在所有比score小的节点中分数最大的）（查找每一层相邻的节点）
+	// 插入的时候，如果要更新，则只需要更新每一层相邻的节点
+	// 同时也是查找需要插入的位置
 	for (i = zsl->level - 1; i >= 0; i--) {
 		while (x->forward[i] &&
 		        (x->forward[i]->score < score ||
@@ -4993,30 +5003,40 @@ static void zslInsert(zskiplist *zsl, double score, robj *obj) {
 	 * happpen since the caller of zslInsert() should test in the hash table
 	 * if the element is already inside or not. */
 	level = zslRandomLevel();
+	// 比当前最高层级大，要更新头节点信息
 	if (level > zsl->level) {
 		for (i = zsl->level; i < level; i++)
 			update[i] = zsl->header;
 		zsl->level = level;
 	}
+	// 创建节点
 	x = zslCreateNode(level, score, obj);
 	for (i = 0; i < level; i++) {
+		// 保存所有相邻左边节点的forward节点指针（指向下一个节点）
 		x->forward[i] = update[i]->forward[i];
+		// 更新相邻左边节点的forward指针，指向当前x节点
 		update[i]->forward[i] = x;
 	}
+	// 如果不是首节点，则更新backward回退指针
 	x->backward = (update[0] == zsl->header) ? NULL : update[0];
+	// 如果不是最后一个节点，则更新下一个节点的backward，指向当前节点
 	if (x->forward[0])
 		x->forward[0]->backward = x;
 	else
+		// 否则更新尾节点指针
 		zsl->tail = x;
+	// 链表长度+1
 	zsl->length++;
 }
 
 /* Delete an element with matching score/object from the skiplist. */
+// 删除指定节点，和插入类似，先查找相邻的节点，再更新节点信息和删除节点
 static int zslDelete(zskiplist *zsl, double score, robj *obj) {
 	zskiplistNode *update[ZSKIPLIST_MAXLEVEL], *x;
 	int i;
 
 	x = zsl->header;
+	// 查找每一层相邻的节点
 	for (i = zsl->level - 1; i >= 0; i--) {
 		while (x->forward[i] &&
 		        (x->forward[i]->score < score ||
@@ -5028,18 +5048,25 @@ static int zslDelete(zskiplist *zsl, double score, robj *obj) {
 	/* We may have multiple elements with the same score, what we need
 	 * is to find the element with both the right score and object. */
 	x = x->forward[0];
+	// 判断x是否为需要删除的节点
 	if (x && score == x->score && compareStringObjects(x->obj, obj) == 0) {
+		// 更新所涉及的相邻节点信息（更新指向x的节点forward指针，使其指向x的后续节点）
 		for (i = 0; i < zsl->level; i++) {
+			// 直到x的最高层
 			if (update[i]->forward[i] != x) break;
 			update[i]->forward[i] = x->forward[i];
 		}
 		if (x->forward[0]) {
+			// 有后续节点
 			x->forward[0]->backward = (x->backward == zsl->header) ?
 			                          NULL : x->backward;
 		} else {
+			// 尾节点
 			zsl->tail = x->backward;
 		}
+		// 删除x节点
 		zslFreeNode(x);
+		// 删除的节点有可能是最高层的，所以需要处理层级降低的情况
 		while (zsl->level > 1 && zsl->header->forward[zsl->level - 1] == NULL)
 			zsl->level--;
 		zsl->length--;
@@ -5054,11 +5081,13 @@ static int zslDelete(zskiplist *zsl, double score, robj *obj) {
  * Min and mx are inclusive, so a score >= min || score <= max is deleted.
  * Note that this function takes the reference to the hash table view of the
  * sorted set, in order to remove the elements from the hash table too. */
+// 删除所有分数在min和max之间的节点
 static unsigned long zslDeleteRange(zskiplist *zsl, double min, double max, dict *dict) {
 	zskiplistNode *update[ZSKIPLIST_MAXLEVEL], *x;
 	unsigned long removed = 0;
 	int i;
 
+	// 先查找出大于min的前一个节点
 	x = zsl->header;
 	for (i = zsl->level - 1; i >= 0; i--) {
 		while (x->forward[i] && x->forward[i]->score < min)
@@ -5069,8 +5098,10 @@ static unsigned long zslDeleteRange(zskiplist *zsl, double min, double max, dict
 	 * is to find the element with both the right score and object. */
 	x = x->forward[0];
 	while (x && x->score <= max) {
+		// 从大于min开始的节点，逐个删除小于max的节点
 		zskiplistNode *next;
 
+		// 和zslDelete删除单个节点类似
 		for (i = 0; i < zsl->level; i++) {
 			if (update[i]->forward[i] != x) break;
 			update[i]->forward[i] = x->forward[i];
@@ -5082,19 +5113,23 @@ static unsigned long zslDeleteRange(zskiplist *zsl, double min, double max, dict
 			zsl->tail = x->backward;
 		}
 		next = x->forward[0];
+		// 将对象从dict中删除（ZSet在dict中保存了对象到分数的映射）
 		dictDelete(dict, x->obj);
 		zslFreeNode(x);
+		// 更新层级
 		while (zsl->level > 1 && zsl->header->forward[zsl->level - 1] == NULL)
 			zsl->level--;
 		zsl->length--;
 		removed++;
 		x = next;
 	}
+	// 返回删除的元素个数
 	return removed; /* not found */
 }
 
 /* Find the first node having a score equal or greater than the specified one.
  * Returns NULL if there is no match. */
+// 查找第一个>=score的节点
 static zskiplistNode *zslFirstWithScore(zskiplist *zsl, double score) {
 	zskiplistNode *x;
 	int i;
@@ -5114,15 +5149,20 @@ static zskiplistNode *zslFirstWithScore(zskiplist *zsl, double score) {
 /* This generic command implements both ZADD and ZINCRBY.
  * scoreval is the score if the operation is a ZADD (doincrement == 0) or
  * the increment if the operation is a ZINCRBY (doincrement == 1). */
+// 同时实现了ZADD和ZINCRBY命令
+// 如果doincrement为0，则为ZADD，否则为ZINCRBY
 static void zaddGenericCommand(redisClient *c, robj *key, robj *ele, double scoreval, int doincrement) {
 	robj *zsetobj;
 	zset *zs;
 	double *score;
 
+	// 先查找ZSet对象
 	zsetobj = lookupKeyWrite(c->db, key);
 	if (zsetobj == NULL) {
+		// 不存在，则创建
 		zsetobj = createZsetObject();
 		dictAdd(c->db->dict, key, zsetobj);
+		// 这里通过增加引用，就不用再次创建Key了
 		incrRefCount(key);
 	} else {
 		if (zsetobj->type != REDIS_ZSET) {
@@ -5139,12 +5179,15 @@ static void zaddGenericCommand(redisClient *c, robj *key, robj *ele, double scor
 	if (doincrement) {
 		dictEntry *de;
 
+		// 执行ZINCRBY
 		/* Read the old score. If the element was not present starts from 0 */
 		de = dictFind(zs->dict, ele);
 		if (de) {
+			// 已有对应的元素，加上原来的值
 			double *oldscore = dictGetEntryVal(de);
 			*score = *oldscore + scoreval;
 		} else {
+			// 不存在，则和ZADD一样
 			*score = scoreval;
 		}
 	} else {
@@ -5153,17 +5196,23 @@ static void zaddGenericCommand(redisClient *c, robj *key, robj *ele, double scor
 
 	/* What follows is a simple remove and re-insert operation that is common
 	 * to both ZADD and ZINCRBY... */
+	// 尝试添加到字典中，如果成功，则表示新的元素，否则已存在了
 	if (dictAdd(zs->dict, ele, score) == DICT_OK) {
 		/* case 1: New element */
+		// 新的元素
+		// 通过增加对象引用，避免对象重复创建
 		incrRefCount(ele); /* added to hash */
 		zslInsert(zs->zsl, *score, ele);
 		incrRefCount(ele); /* added to skiplist */
 		server.dirty++;
 		if (doincrement)
+			// ZINCRBY，返回最新的值
 			addReplyDouble(c, *score);
 		else
+			// ZADD，返回1表示添加成功
 			addReply(c, shared.cone);
 	} else {
+		// 添加失败，表示已经存在元素
 		dictEntry *de;
 		double *oldscore;
 
@@ -5172,6 +5221,7 @@ static void zaddGenericCommand(redisClient *c, robj *key, robj *ele, double scor
 		redisAssert(de != NULL);
 		oldscore = dictGetEntryVal(de);
 		if (*score != *oldscore) {
+			// 如果两个分数不一样，则需要先将旧的删除，再重新插入
 			int deleted;
 
 			/* Remove and insert the element in the skip list with new score */
@@ -5192,6 +5242,7 @@ static void zaddGenericCommand(redisClient *c, robj *key, robj *ele, double scor
 	}
 }
 
+// ZADD命令
 static void zaddCommand(redisClient *c) {
 	double scoreval;
 
@@ -5199,6 +5250,7 @@ static void zaddCommand(redisClient *c) {
 	zaddGenericCommand(c, c->argv[1], c->argv[3], scoreval, 0);
 }
 
+// ZINCRBY命令
 static void zincrbyCommand(redisClient *c) {
 	double scoreval;
 
@@ -5206,6 +5258,7 @@ static void zincrbyCommand(redisClient *c) {
 	zaddGenericCommand(c, c->argv[1], c->argv[3], scoreval, 1);
 }
 
+// ZREM命令，从集合中删除元素
 static void zremCommand(redisClient *c) {
 	robj *zsetobj;
 	zset *zs;
@@ -5228,6 +5281,7 @@ static void zremCommand(redisClient *c) {
 			addReply(c, shared.czero);
 			return;
 		}
+		// 先从Skiplist中删除对应的节点，再从字典中删除
 		/* Delete from the skiplist */
 		oldscore = dictGetEntryVal(de);
 		deleted = zslDelete(zs->zsl, *oldscore, c->argv[2]);
@@ -5241,6 +5295,7 @@ static void zremCommand(redisClient *c) {
 	}
 }
 
+// 根据指定的分数范围来删除元素，调用zslDeleteRange来实现
 static void zremrangebyscoreCommand(redisClient *c) {
 	double min = strtod(c->argv[2]->ptr, NULL);
 	double max = strtod(c->argv[3]->ptr, NULL);
@@ -5265,6 +5320,7 @@ static void zremrangebyscoreCommand(redisClient *c) {
 	}
 }
 
+// 查找指定排名区间的元素（和普通的双向链表实现类似）
 static void zrangeGenericCommand(redisClient *c, int reverse) {
 	robj *o;
 	int start = atoi(c->argv[2]->ptr);
@@ -5342,6 +5398,7 @@ static void zrevrangeCommand(redisClient *c) {
 	zrangeGenericCommand(c, 1);
 }
 
+// 根据指定分数范围来获取元素
 static void zrangebyscoreCommand(redisClient *c) {
 	robj *o;
 	double min = strtod(c->argv[2]->ptr, NULL);
@@ -5368,6 +5425,7 @@ static void zrangebyscoreCommand(redisClient *c) {
 		if (o->type != REDIS_ZSET) {
 			addReply(c, shared.wrongtypeerr);
 		} else {
+			// 执行查找
 			zset *zsetobj = o->ptr;
 			zskiplist *zsl = zsetobj->zsl;
 			zskiplistNode *ln;
@@ -5375,6 +5433,7 @@ static void zrangebyscoreCommand(redisClient *c) {
 			unsigned int rangelen = 0;
 
 			/* Get the first node with the score >= min */
+			// 先找到第一个比min大的元素（logN）
 			ln = zslFirstWithScore(zsl, min);
 			if (ln == NULL) {
 				/* No element matching the speciifed interval */
@@ -5391,7 +5450,9 @@ static void zrangebyscoreCommand(redisClient *c) {
 			decrRefCount(lenobj);
 
 			while (ln && ln->score <= max) {
+				// 而后逐个遍历（总时间复杂度logN+M）
 				if (offset) {
+					// 偏移个数
 					offset--;
 					ln = ln->forward[0];
 					continue;
@@ -5403,6 +5464,7 @@ static void zrangebyscoreCommand(redisClient *c) {
 				addReply(c, shared.crlf);
 				ln = ln->forward[0];
 				rangelen++;
+				// limit为需要返回的个数
 				if (limit > 0) limit--;
 			}
 			lenobj->ptr = sdscatprintf(sdsempty(), "*%d\r\n", rangelen);
@@ -5410,6 +5472,7 @@ static void zrangebyscoreCommand(redisClient *c) {
 	}
 }
 
+// 获取ZSet集合元素个数
 static void zcardCommand(redisClient *c) {
 	robj *o;
 	zset *zs;
@@ -5428,6 +5491,7 @@ static void zcardCommand(redisClient *c) {
 	}
 }
 
+// 获取指定元素的分数
 static void zscoreCommand(redisClient *c) {
 	robj *o;
 	zset *zs;
@@ -5443,6 +5507,7 @@ static void zscoreCommand(redisClient *c) {
 			dictEntry *de;
 
 			zs = o->ptr;
+			// 直接在dict中根据对象查找
 			de = dictFind(zs->dict, c->argv[2]);
 			if (!de) {
 				addReply(c, shared.nullbulk);
