@@ -278,6 +278,8 @@ typedef struct redisDb {
 	dict *dict;                 /* The keyspace for this DB */
 	// 用于保存设置了过期时间的键
 	dict *expires;              /* Timeout of keys with a timeout set */
+	// 存放当前阻塞的Key到客户端的映射（用于实现一个Key存放数据后，可以快速的找到对应的客户端）
+	// Keys -> List(redisClient) 默认先取第一个先等待的客户端
 	dict *blockingkeys;         /* Keys with clients waiting for data (BLPOP) */
 	// ID,标识当前库，用于区分多个库，从0开始
 	int id;
@@ -6106,6 +6108,7 @@ static int deleteIfVolatile(redisDb *db, robj *key) {
 	return dictDelete(db->dict, key) == DICT_OK;
 }
 
+// 过期命令通用实现
 static void expireGenericCommand(redisClient *c, robj *key, time_t seconds) {
 	dictEntry *de;
 
@@ -6115,10 +6118,12 @@ static void expireGenericCommand(redisClient *c, robj *key, time_t seconds) {
 		return;
 	}
 	if (seconds < 0) {
+		// 时间小于0，则直接淘汰
 		if (deleteKey(c->db, key)) server.dirty++;
 		addReply(c, shared.cone);
 		return;
 	} else {
+		// 向过期Dict中加入<key,time>映射即可
 		time_t when = time(NULL) + seconds;
 		if (setExpire(c->db, key, when)) {
 			addReply(c, shared.cone);
@@ -6138,6 +6143,7 @@ static void expireatCommand(redisClient *c) {
 	expireGenericCommand(c, c->argv[1], strtol(c->argv[2]->ptr, NULL, 10) - time(NULL));
 }
 
+// 获取过期时间,-1表示没有过期时间（键不在过期Dict中）
 static void ttlCommand(redisClient *c) {
 	time_t expire;
 	int ttl = -1;
@@ -6153,12 +6159,14 @@ static void ttlCommand(redisClient *c) {
 /* ================================ MULTI/EXEC ============================== */
 
 /* Client state initialization for MULTI/EXEC */
+// 初始化MULTI状态
 static void initClientMultiState(redisClient *c) {
 	c->mstate.commands = NULL;
 	c->mstate.count = 0;
 }
 
 /* Release all the resources associated with MULTI/EXEC state */
+// 释放MULTI缓存起来的所有命令
 static void freeClientMultiState(redisClient *c) {
 	int j;
 
@@ -6174,6 +6182,7 @@ static void freeClientMultiState(redisClient *c) {
 }
 
 /* Add a new command into the MULTI commands queue */
+// 之前执行了MULTI，将命令缓存到起来
 static void queueMultiCommand(redisClient *c, struct redisCommand *cmd) {
 	multiCmd *mc;
 	int j;
@@ -6190,11 +6199,13 @@ static void queueMultiCommand(redisClient *c, struct redisCommand *cmd) {
 	c->mstate.count++;
 }
 
+// 将客户端状态置为MULTI，用于后续判断该状态，将命令放入队列中缓存起来，直到EXEC执行或者DISCARD抛弃
 static void multiCommand(redisClient *c) {
 	c->flags |= REDIS_MULTI;
 	addReply(c, shared.ok);
 }
 
+// 执行之前缓存起来的命令
 static void execCommand(redisClient *c) {
 	int j;
 	robj **orig_argv;
@@ -6217,6 +6228,7 @@ static void execCommand(redisClient *c) {
 	c->argc = orig_argc;
 	freeClientMultiState(c);
 	initClientMultiState(c);
+	// 恢复状态（将之前的MULTI状态清除掉）
 	c->flags &= (~REDIS_MULTI);
 }
 
@@ -6253,6 +6265,7 @@ static void execCommand(redisClient *c) {
 
 /* Set a client in blocking mode for the specified key, with the specified
  * timeout */
+// 阻塞客户端，等待指定的Keys
 static void blockForKeys(redisClient *c, robj **keys, int numkeys, time_t timeout) {
 	dictEntry *de;
 	list *l;
@@ -6267,11 +6280,13 @@ static void blockForKeys(redisClient *c, robj **keys, int numkeys, time_t timeou
 		incrRefCount(keys[j]);
 
 		/* And in the other "side", to map keys -> clients */
+		// 查找是否已存在对应的Keys
 		de = dictFind(c->db->blockingkeys, keys[j]);
 		if (de == NULL) {
 			int retval;
 
 			/* For every key we take a list of clients blocked for it */
+			// 没有客户端在等待该Key，则需先创建List，用于处理多个客户端等待同一个Key的情况
 			l = listCreate();
 			retval = dictAdd(c->db->blockingkeys, keys[j], l);
 			incrRefCount(keys[j]);
@@ -6279,16 +6294,18 @@ static void blockForKeys(redisClient *c, robj **keys, int numkeys, time_t timeou
 		} else {
 			l = dictGetEntryVal(de);
 		}
+		// 放入队尾，FIFO策略
 		listAddNodeTail(l, c);
 	}
 	/* Mark the client as a blocked client */
+	// 置为BLOCKED以及删除读处理句柄（不再处理客户端请求）
 	c->flags |= REDIS_BLOCKED;
 	aeDeleteFileEvent(server.el, c->fd, AE_READABLE);
 	server.blockedclients++;
 }
 
 /* Unblock a client that's waiting in a blocking operation such as BLPOP */
-// 将客户端从阻塞列表中移除（一般是获取到了数据）
+// 将客户端从阻塞列表中移除（一般是获取到了数据或者关闭客户端）
 static void unblockClientWaitingData(redisClient *c) {
 	dictEntry *de;
 	list *l;
