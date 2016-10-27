@@ -1094,6 +1094,7 @@ static void oom(const char *msg) {
 }
 
 /* ====================== Redis server networking stuff ===================== */
+// 处理客户端超时的情况（空闲或者阻塞）
 static void closeTimedoutClients(void) {
 	redisClient *c;
 	listNode *ln;
@@ -1108,10 +1109,14 @@ static void closeTimedoutClients(void) {
 		        !(c->flags & REDIS_MASTER) &&   /* no timeout for masters */
 		        (now - c->lastinteraction > server.maxidletime))
 		{
+			// 处理客户端空闲超时情况
+			// 即使客户端在阻塞状态等待，但是超过最大空闲时间，也会关闭连接
 			redisLog(REDIS_VERBOSE, "Closing idle client");
 			freeClient(c);
 		} else if (c->flags & REDIS_BLOCKED) {
+			// 处理客户端阻塞超时情况
 			if (c->blockingto != 0 && c->blockingto < now) {
+				// 超时，应答Null
 				addReply(c, shared.nullmultibulk);
 				unblockClientWaitingData(c);
 			}
@@ -5524,6 +5529,7 @@ static void zscoreCommand(redisClient *c) {
 
 /* ========================= Non type-specific commands  ==================== */
 
+// 清空当前Redis内存的所有数据
 static void flushdbCommand(redisClient *c) {
 	server.dirty += dictSize(c->db->dict);
 	dictEmpty(c->db->dict);
@@ -5531,6 +5537,7 @@ static void flushdbCommand(redisClient *c) {
 	addReply(c, shared.ok);
 }
 
+// 清空Redis内存的所有数据，包括RDB持久化的数据
 static void flushallCommand(redisClient *c) {
 	server.dirty += emptyDb();
 	addReply(c, shared.ok);
@@ -6273,6 +6280,7 @@ static void blockForKeys(redisClient *c, robj **keys, int numkeys, time_t timeou
 
 	c->blockingkeys = zmalloc(sizeof(robj*)*numkeys);
 	c->blockingkeysnum = numkeys;
+	// 客户端等待超时时间
 	c->blockingto = timeout;
 	for (j = 0; j < numkeys; j++) {
 		/* Add the key in the client structure, to map clients -> keys */
