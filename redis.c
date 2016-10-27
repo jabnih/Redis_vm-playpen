@@ -3630,7 +3630,9 @@ eoferr: /* unexpected end of file is handled here with a fatal exit */
 
 /*================================== Commands =============================== */
 
+// 密码认证
 static void authCommand(redisClient *c) {
+	// 简单的比对字符串
 	if (!server.requirepass || !strcmp(c->argv[1]->ptr, server.requirepass)) {
 		c->authenticated = 1;
 		addReply(c, shared.ok);
@@ -3640,10 +3642,12 @@ static void authCommand(redisClient *c) {
 	}
 }
 
+// PING命令
 static void pingCommand(redisClient *c) {
 	addReply(c, shared.pong);
 }
 
+// 回显
 static void echoCommand(redisClient *c) {
 	addReplyBulkLen(c, c->argv[1]);
 	addReply(c, c->argv[1]);
@@ -3944,6 +3948,7 @@ static void dbsizeCommand(redisClient *c) {
 	            sdscatprintf(sdsempty(), ":%lu\r\n", dictSize(c->db->dict)));
 }
 
+// 获取最近一次RDB持久化成功的时间
 static void lastsaveCommand(redisClient *c) {
 	addReplySds(c,
 	            sdscatprintf(sdsempty(), ":%lu\r\n", server.lastsave));
